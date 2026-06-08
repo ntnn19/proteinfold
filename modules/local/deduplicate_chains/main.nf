@@ -14,8 +14,9 @@ process DEDUPLICATE_CHAINS {
         'community.wave.seqera.io/library/biopython_python:06582b7b722f3db3' }"
 
     input:
-    path "fastas/*"
-    path input_tsv
+    tuple val(meta), path(fasta)
+    path input_tsv                  //  string: Path to input samplesheet
+
 
     output:
     path "chain_map.json"              , emit: chain_map

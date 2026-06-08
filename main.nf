@@ -27,7 +27,7 @@ include { PREPARE_COLABFOLD_DBS  as PREPARE_COLABFOLD_DBS_COLABFOLD } from './su
 include { PREPARE_COLABFOLD_DBS  as PREPARE_COLABFOLD_DBS_BOLTZ     } from './subworkflows/local/prepare_colabfold_dbs'
 
 include { ALPHAFOLD2                       } from './workflows/alphafold2'
-include { ALPHAFOLD3                       } from './workflows/alphafold3'
+include { ALPHAFOLD3                       } from './workflows/alphafold3_biomni'
 include { COLABFOLD                        } from './workflows/colabfold'
 include { ESMFOLD                          } from './workflows/esmfold'
 include { ROSETTAFOLD_ALL_ATOM             } from './workflows/rosettafold_all_atom'
@@ -197,6 +197,7 @@ workflow NFCORE_PROTEINFOLD {
         //
         // WORKFLOW: Run nf-core/alphafold3 workflow
         //
+        ch_samplesheet
         ALPHAFOLD3 (
             ch_samplesheet,
             ch_versions,
@@ -623,8 +624,13 @@ workflow {
     //
     // WORKFLOW: Run main workflow
     //
+    duplicated = PIPELINE_INITIALISATION.out.samplesheet
+    duplicated_collected = duplicated.collate(2)
+        .map { meta, fasta ->
+            [meta, fasta]
+        }
     NFCORE_PROTEINFOLD (
-        PIPELINE_INITIALISATION.out.samplesheet
+        duplicated_collected
     )
 
     //
