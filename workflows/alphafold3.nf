@@ -12,6 +12,14 @@ include { RUN_ALPHAFOLD3                    } from '../modules/local/run_alphafo
 include { MMCIF2PDB as MMCIF2PDB_TOP_RANKED } from '../modules/local/mmcif2pdb/main.nf'
 include { MMCIF2PDB as MMCIF2PDB_MODELS     } from '../modules/local/mmcif2pdb/main.nf'
 
+//
+// MODULE: Deduplicated MSA workflow modules (opt-in via --alphafold3_deduplicate_msa)
+//
+include { DEDUPLICATE_CHAINS                } from '../modules/local/deduplicate_chains'
+include { ASSEMBLE_MULTIMER_JSON            } from '../modules/local/assemble_multimer_json'
+include { RUN_ALPHAFOLD3_DATA_PIPELINE      } from '../modules/local/run_alphafold3_data_pipeline'
+include { RUN_ALPHAFOLD3_INFERENCE          } from '../modules/local/run_alphafold3_inference'
+
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     IMPORT NF-CORE MODULES/SUBWORKFLOWS
@@ -43,108 +51,276 @@ workflow ALPHAFOLD3 {
     ch_msa_final      = channel.empty()
     ch_multiqc_report = channel.empty()
 
-    FASTA_TO_ALPHAFOLD3_JSON(ch_samplesheet)
-    ch_versions       = ch_versions.mix(FASTA_TO_ALPHAFOLD3_JSON.out.versions)
+    if (params.alphafold3_deduplicate_msa) {
+        //
+        // DEDUPLICATED MSA WORKFLOW
+        // Run data pipeline only for unique protein/RNA chains,
+        // then assemble multimeric JSONs with pre-computed MSAs,
+        // then run inference-only.
+        //
 
-    //
-    // SUBWORKFLOW: Run AlphaFold3
-    //
-    RUN_ALPHAFOLD3 (
-        FASTA_TO_ALPHAFOLD3_JSON.out.json,
-        ch_alphafold3_params,
-        ch_small_bfd,
-        ch_mgnify,
-        ch_mmcif_files,
-        ch_uniref90,
-        ch_pdb_seqres,
-        ch_uniprot
-    )
-    ch_versions = ch_versions.mix(RUN_ALPHAFOLD3.out.versions)
+        // Step 1: Build input TSV and collect all FASTAs for deduplication
+        // The TSV maps sample_id -> fasta_path so that chain_map.json
+        // uses the original sample IDs from the samplesheet.
+        // We fork the samplesheet channel to consume it twice.
+        ch_samplesheet_dup = ch_samplesheet.dup()
 
-    // Convert mmcif to pdbs
-    RUN_ALPHAFOLD3
-            .out
-            .cif
-            .groupTuple()
-            .map {
-                meta, files ->
-                [ meta, files.flatten() ]
+        ch_input_tsv = ch_samplesheet_dup
+            .map { meta, fasta -> "${meta.id}\t${fasta}" }
+            .collectFile(name: 'input.tsv', storeDir: '.', sort: true)
+
+        ch_fasta_collect = ch_samplesheet_dup
+            .map { meta, fasta -> fasta }
+            .collect()
+
+        DEDUPLICATE_CHAINS(ch_fasta_collect, ch_input_tsv)
+        ch_versions = ch_versions.mix(DEDUPLICATE_CHAINS.out.versions)
+
+        // Step 2: Convert each unique chain FASTA to monomer JSON
+        ch_unique_chain_meta = DEDUPLICATE_CHAINS.out.unique_fasta
+            .map { fasta ->
+                def name = fasta.baseName
+                def meta = [:]
+                meta.id = name
+                [ meta, fasta ]
             }
 
-    // Convert models mmcifs to pdbs
-    MMCIF2PDB_MODELS (
-        RUN_ALPHAFOLD3
-            .out
-            .cif
-            .groupTuple()
-            .map {
-                meta, files ->
-                [ meta, files.flatten() ]
+        FASTA_TO_ALPHAFOLD3_JSON(ch_unique_chain_meta)
+        ch_versions = ch_versions.mix(FASTA_TO_ALPHAFOLD3_JSON.out.versions)
+
+        // Step 3: Run data pipeline (MSA + templates) for each unique chain
+        RUN_ALPHAFOLD3_DATA_PIPELINE(
+            FASTA_TO_ALPHAFOLD3_JSON.out.json,
+            ch_alphafold3_params,
+            ch_small_bfd,
+            ch_mgnify,
+            ch_mmcif_files,
+            ch_uniref90,
+            ch_pdb_seqres,
+            ch_uniprot
+        )
+        ch_versions = ch_versions.mix(RUN_ALPHAFOLD3_DATA_PIPELINE.out.versions)
+
+        // Step 4: Collect all data JSONs and assemble multimeric JSONs
+        ch_data_jsons_collect = RUN_ALPHAFOLD3_DATA_PIPELINE.out.data_json
+            .map { meta, data_json -> data_json }
+            .collect()
+
+        ASSEMBLE_MULTIMER_JSON(
+            DEDUPLICATE_CHAINS.out.chain_map,
+            ch_data_jsons_collect
+        )
+        ch_versions = ch_versions.mix(ASSEMBLE_MULTIMER_JSON.out.versions)
+
+        // Split assembled JSONs into per-sample channels
+        // Each JSON filename is <sanitised_sample_id>.json
+        ch_assembled_json = ASSEMBLE_MULTIMER_JSON.out.json
+            .flatten()
+            .map { json_file ->
+                def name = json_file.baseName
+                def meta = [:]
+                meta.id = name
+                [ meta, json_file ]
             }
-    )
-    ch_versions = ch_versions.mix(MMCIF2PDB_MODELS.out.versions)
 
-    MMCIF2PDB_MODELS
-        .out
-        .pdb
-        .map { it ->
-            def meta   = it[0].clone();
-            meta.model = "alphafold3";
-            def files = (it[1] instanceof List) ? it[1] : [ it[1] ]
-            [ meta, files ]
-        }
-        .set { ch_pdb_final }
+        // Step 5: Run inference-only on assembled multimer JSONs
+        RUN_ALPHAFOLD3_INFERENCE(
+            ch_assembled_json,
+            ch_alphafold3_params,
+            ch_small_bfd,
+            ch_mgnify,
+            ch_mmcif_files,
+            ch_uniref90,
+            ch_pdb_seqres,
+            ch_uniprot
+        )
+        ch_versions = ch_versions.mix(RUN_ALPHAFOLD3_INFERENCE.out.versions)
 
-    // Convert top ranked mmcif to pdb
-    MMCIF2PDB_TOP_RANKED (
+        // Post-processing: same as standard flow
+        // Convert models mmcifs to pdbs
+        MMCIF2PDB_MODELS (
+            RUN_ALPHAFOLD3_INFERENCE
+                .out
+                .cif
+                .groupTuple()
+                .map {
+                    meta, files ->
+                    [ meta, files.flatten() ]
+                }
+        )
+        ch_versions = ch_versions.mix(MMCIF2PDB_MODELS.out.versions)
+
+        MMCIF2PDB_MODELS
+            .out
+            .pdb
+            .map { it ->
+                def meta   = it[0].clone();
+                meta.model = "alphafold3";
+                def files = (it[1] instanceof List) ? it[1] : [ it[1] ]
+                [ meta, files ]
+            }
+            .set { ch_pdb_final }
+
+        // Convert top ranked mmcif to pdb
+        MMCIF2PDB_TOP_RANKED (
+            RUN_ALPHAFOLD3_INFERENCE
+                .out
+                .top_ranked_cif
+        )
+        ch_versions = ch_versions.mix(MMCIF2PDB_TOP_RANKED.out.versions)
+
+        MMCIF2PDB_TOP_RANKED
+            .out
+            .pdb
+            .map { it ->
+                def meta = it[0].clone();
+                meta.model = "alphafold3";
+                [ meta, it[1] ]
+            }
+            .set { ch_top_ranked_pdb }
+
+        // Prepare msa input
+        RUN_ALPHAFOLD3_INFERENCE
+            .out
+            .msa
+            .map { it ->
+                def meta = it[0].clone();
+                meta.model = "alphafold3";
+                [ meta, it[1] ]
+            }
+            .set { ch_msa_final }
+
+        // Prepare report input
+        RUN_ALPHAFOLD3_INFERENCE
+            .out
+            .multiqc
+            .map { it -> it[1] }
+            .toSortedList()
+            .map { it ->
+                [ [ "model": "alphafold3" ], it.flatten() ]
+            }
+            .set { ch_multiqc_report }
+
+        // Prepare pae input
+        RUN_ALPHAFOLD3_INFERENCE
+            .out
+            .pae
+            .map { it ->
+                def meta = it[0].clone();
+                meta.model = "alphafold3";
+                [ meta, it[1] ]
+            }
+            .set { ch_pae_final }
+
+    } else {
+        //
+        // STANDARD WORKFLOW (unchanged)
+        //
+
+        FASTA_TO_ALPHAFOLD3_JSON(ch_samplesheet)
+        ch_versions       = ch_versions.mix(FASTA_TO_ALPHAFOLD3_JSON.out.versions)
+
+        //
+        // SUBWORKFLOW: Run AlphaFold3
+        //
+        RUN_ALPHAFOLD3 (
+            FASTA_TO_ALPHAFOLD3_JSON.out.json,
+            ch_alphafold3_params,
+            ch_small_bfd,
+            ch_mgnify,
+            ch_mmcif_files,
+            ch_uniref90,
+            ch_pdb_seqres,
+            ch_uniprot
+        )
+        ch_versions = ch_versions.mix(RUN_ALPHAFOLD3.out.versions)
+
+        // Convert mmcif to pdbs
+        RUN_ALPHAFOLD3
+                .out
+                .cif
+                .groupTuple()
+                .map {
+                    meta, files ->
+                    [ meta, files.flatten() ]
+                }
+
+        // Convert models mmcifs to pdbs
+        MMCIF2PDB_MODELS (
+            RUN_ALPHAFOLD3
+                .out
+                .cif
+                .groupTuple()
+                .map {
+                    meta, files ->
+                    [ meta, files.flatten() ]
+                }
+        )
+        ch_versions = ch_versions.mix(MMCIF2PDB_MODELS.out.versions)
+
+        MMCIF2PDB_MODELS
+            .out
+            .pdb
+            .map { it ->
+                def meta   = it[0].clone();
+                meta.model = "alphafold3";
+                def files = (it[1] instanceof List) ? it[1] : [ it[1] ]
+                [ meta, files ]
+            }
+            .set { ch_pdb_final }
+
+        // Convert top ranked mmcif to pdb
+        MMCIF2PDB_TOP_RANKED (
+            RUN_ALPHAFOLD3
+                .out
+                .top_ranked_cif
+        )
+        ch_versions = ch_versions.mix(MMCIF2PDB_TOP_RANKED.out.versions)
+
+        MMCIF2PDB_TOP_RANKED
+            .out
+            .pdb
+            .map { it ->
+                def meta = it[0].clone();
+                meta.model = "alphafold3";
+                [ meta, it[1] ]
+            }
+            .set { ch_top_ranked_pdb }
+
+        // Prepare msa input
         RUN_ALPHAFOLD3
             .out
-            .top_ranked_cif
-    )
-    ch_versions = ch_versions.mix(MMCIF2PDB_TOP_RANKED.out.versions)
+            .msa
+            .map { it ->
+                def meta = it[0].clone();
+                meta.model = "alphafold3";
+                [ meta, it[1] ]
+            }
+            .set { ch_msa_final }
 
-    MMCIF2PDB_TOP_RANKED
-        .out
-        .pdb
-        .map { it ->
-            def meta = it[0].clone();
-            meta.model = "alphafold3";
-            [ meta, it[1] ]
-        }
-        .set { ch_top_ranked_pdb }
+        // Prepare report input
+        RUN_ALPHAFOLD3
+            .out
+            .multiqc
+            .map { it -> it[1] }
+            .toSortedList()
+            .map { it ->
+                [ [ "model": "alphafold3" ], it.flatten() ]
+            }
+            .set { ch_multiqc_report }
 
-    // Prepare msa input
-    RUN_ALPHAFOLD3
-        .out
-        .msa
-        .map { it ->
-            def meta = it[0].clone();
-            meta.model = "alphafold3";
-            [ meta, it[1] ]
-        }
-        .set { ch_msa_final }
+        // Prepare dummy pae input
+        RUN_ALPHAFOLD3
+            .out
+            .pae
+            .map { it ->
+                def meta = it[0].clone();
+                meta.model = "alphafold3";
+                [ meta, it[1] ]
+            }
+            .set { ch_pae_final }
 
-    // Prepare report input
-    RUN_ALPHAFOLD3
-        .out
-        .multiqc
-        .map { it -> it[1] }
-        .toSortedList()
-        .map { it ->
-            [ [ "model": "alphafold3" ], it.flatten() ]
-        }
-        .set { ch_multiqc_report }
-
-    // Prepare dummy pae input
-    RUN_ALPHAFOLD3
-        .out
-        .pae
-        .map { it ->
-            def meta = it[0].clone();
-            meta.model = "alphafold3";
-            [ meta, it[1] ]
-        }
-        .set { ch_pae_final }
+    } // end if/else deduplicate_msa
 
     emit:
     top_ranked_pdb = ch_top_ranked_pdb // channel: [ id, /path/to/*.pdb ]

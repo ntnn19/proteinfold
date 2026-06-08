@@ -689,6 +689,12 @@
                     "description": "Path to the Rfam database",
                     "fa_icon": "fas fa-folder-open",
                     "default": "null/rfam/*"
+                },
+                "alphafold3_deduplicate_msa": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Deduplicate protein/RNA chains across all samples and run MSA search only for unique chains, then assemble multimeric JSONs with pre-computed MSAs.",
+                    "fa_icon": "fas fa-compress-arrows-alt"
                 }
             }
         },
