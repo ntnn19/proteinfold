@@ -1,0 +1,6 @@
+name: deduplicate_chains
+channels:
+  - conda-forge
+dependencies:
+  - conda-forge::python=3.13.7
+  - conda-forge::biopython=1.84
